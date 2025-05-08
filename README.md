@@ -1,7 +1,11 @@
 # UIEAnything
 UIEAnything: Zero-Shot Underwater Image Enhancement via Advanced Depth Estimation, White Balance Models, and Improved Sea-thru
+https://link.springer.com/article/10.1007/s10044-025-01422-z
 
+please download depthanythingv2 checkpoint by your self
 
+Dr. Jinxin SHAO
+2025/5/8
 
 PAA_results download link:
 通过网盘分享的文件：PAA_Supplementary_Material.zip
