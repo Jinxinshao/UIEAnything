@@ -96,10 +96,28 @@ import cv2
 def henvey_greenstein_phase_function(theta, g):
     return (1 - g**2) / (1 + g**2 - 2 * g * np.cos(theta))**1.5
 
+
 def monte_carlo_scattering(D, depths, scattering_coeff):
+    """
+    蒙特卡洛散射模拟函数
+    
+    参数:
+        D: 直接信号（去除背散射后的图像）
+        depths: 深度图
+        scattering_coeff: 散射系数
+    
+    返回:
+        scattered_light: 散射光估计
+    """
+    # 确保depths是浮点类型，避免uint8溢出问题
+    depths_float = depths.astype(np.float32)
+    
     # 定义亨尼-格林斯坦相函数参数
     g = 0.8  # 不对称因子，水下环境通常取 0.8
     energy_factor = 0.01  # 控制散射核的总能量
+    
+    # 调整吸收系数，避免过大的值导致数值问题
+    absorption_coeff = 0.5  # 从1.0降低到0.5，更合理的水体吸收系数
 
     # 核的尺寸
     kernel_size = int(scattering_coeff * 10)
@@ -112,22 +130,31 @@ def monte_carlo_scattering(D, depths, scattering_coeff):
     x = np.arange(kernel_size) - center
     y = np.arange(kernel_size) - center
     xv, yv = np.meshgrid(x, y)
-    r = np.sqrt(xv**2 + yv**2) + 1e-2  # 防止除零
+    r = np.sqrt(xv**2 + yv**2) + 1e-6  # 防止除零
 
     # 计算对应的散射角（小角度近似）
-    theta = np.arctan(r / (depths.mean() + 1e-2))
+    # 使用安全的深度均值计算
+    depth_mean = np.mean(depths_float)
+    if depth_mean < 1e-6:
+        depth_mean = 1.0  # 防止除零
+    
+    theta = np.arctan(r / depth_mean)
 
     # 计算散射核
     phase_function = henvey_greenstein_phase_function(theta, g)
-    kernel = phase_function / np.sum(phase_function)  # 归一化
+    kernel = phase_function / (np.sum(phase_function) + 1e-10)  # 归一化，添加小值防止除零
     kernel *= energy_factor  # 调整能量
 
     # 对直接信号应用散射核
     scattered_light = cv2.filter2D(D, -1, kernel)
 
     # 加入深度依赖的衰减因子
-    absorption_coeff = 1  # 根据水体特性设置
-    depth_attenuation = np.exp(-absorption_coeff * depths)
+    # 使用安全的指数计算，避免数值溢出
+    exponent = -absorption_coeff * depths_float
+    # 限制指数范围，避免极端值
+    exponent = np.clip(exponent, -10, 0)
+    depth_attenuation = np.exp(exponent)
+    
     scattered_light *= depth_attenuation
 
     return scattered_light
@@ -900,6 +927,18 @@ def smooth_depth_map(depths, kernel_size=5):
 
 def run_pipeline(img, depths, args):
     wavelengths = {'R': 650, 'G': 550, 'B': 450}
+    
+        # 确保depths是浮点类型，范围在0-1之间
+    if depths.dtype != np.float32 and depths.dtype != np.float64:
+        print(f'Converting depths from {depths.dtype} to float32', flush=True)
+        if depths.max() > 1.0:
+            # 如果depths是0-255范围，归一化到0-1
+            depths = depths.astype(np.float32) / 255.0
+        else:
+            depths = depths.astype(np.float32)
+    
+    # 确保depths的值在合理范围内
+    depths = np.clip(depths, 0.01, 1.0)  # 避免零深度
     depths = smooth_depth_map(depths)
     print('Estimating backscatter...', flush=True)
     Br, coefs_r = find_backscatter_values_improved(find_backscatter_estimation_points(img[:,:,0], depths), depths, wavelength=620)
