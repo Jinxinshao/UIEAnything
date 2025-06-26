@@ -114,13 +114,13 @@ def monte_carlo_scattering(D, depths, scattering_coeff):
     
     # 定义亨尼-格林斯坦相函数参数
     g = 0.8  # 不对称因子，水下环境通常取 0.8
-    energy_factor = 0.01  # 控制散射核的总能量
+    energy_factor = 0.005  # 控制散射核的总能量
     
     # 调整吸收系数，避免过大的值导致数值问题
     absorption_coeff = 0.5  # 从1.0降低到0.5，更合理的水体吸收系数
 
     # 核的尺寸
-    kernel_size = int(scattering_coeff * 10)
+    kernel_size = min(int(scattering_coeff * 5), 11)  # 降低核大小上限
     kernel_size = max(kernel_size, 3)  # 确保最小尺寸
     if kernel_size % 2 == 0:
         kernel_size += 1  # 确保为奇数
@@ -130,19 +130,19 @@ def monte_carlo_scattering(D, depths, scattering_coeff):
     x = np.arange(kernel_size) - center
     y = np.arange(kernel_size) - center
     xv, yv = np.meshgrid(x, y)
-    r = np.sqrt(xv**2 + yv**2) + 1e-6  # 防止除零
+    r = np.sqrt(xv**2 + yv**2) + 1e-5  # 防止除零
 
     # 计算对应的散射角（小角度近似）
     # 使用安全的深度均值计算
-    depth_mean = np.mean(depths_float)
-    if depth_mean < 1e-6:
-        depth_mean = 1.0  # 防止除零
+    # depth_mean = np.mean(depths_float)
+    depth_mean = np.clip(np.mean(depths_float), 0.01, 10.0)
+
     
     theta = np.arctan(r / depth_mean)
 
     # 计算散射核
     phase_function = henvey_greenstein_phase_function(theta, g)
-    kernel = phase_function / (np.sum(phase_function) + 1e-10)  # 归一化，添加小值防止除零
+    kernel = phase_function / (np.sum(phase_function) + 1e-5)  # 归一化，添加小值防止除零
     kernel *= energy_factor  # 调整能量
 
     # 对直接信号应用散射核
@@ -152,12 +152,14 @@ def monte_carlo_scattering(D, depths, scattering_coeff):
     # 使用安全的指数计算，避免数值溢出
     exponent = -absorption_coeff * depths_float
     # 限制指数范围，避免极端值
-    exponent = np.clip(exponent, -10, 0)
+    exponent = np.clip(exponent, -5, 0)
     depth_attenuation = np.exp(exponent)
     
     scattered_light *= depth_attenuation
 
     return scattered_light
+
+
 
 '''
 def monte_carlo_scattering(D, depths, scattering_coeff):
