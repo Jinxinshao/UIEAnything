@@ -114,7 +114,7 @@ def monte_carlo_scattering(D, depths, scattering_coeff):
     
     # 定义亨尼-格林斯坦相函数参数
     g = 0.8  # 不对称因子，水下环境通常取 0.8
-    energy_factor = 0.005  # 控制散射核的总能量
+    energy_factor = 0.001  # 控制散射核的总能量
     
     # 调整吸收系数，避免过大的值导致数值问题
     absorption_coeff = 0.5  # 从1.0降低到0.5，更合理的水体吸收系数
@@ -190,7 +190,9 @@ def estimate_illumination_improved(img, B, depths, neighborhood_map, num_neighbo
         locs_list[label - 1] = np.where(neighborhood_map == label)
         sizes[label - 1] = np.size(locs_list[label - 1][0])
     
-    for _ in range(max_iters):
+    decay_factor = 0.95   # 每次迭代的衰减因子
+    
+    for iter_idx in range(max_iters):
         for label in range(1, num_neighborhoods + 1):
             locs = locs_list[label - 1]
             size = sizes[label - 1] - 1
@@ -198,7 +200,8 @@ def estimate_illumination_improved(img, B, depths, neighborhood_map, num_neighbo
         
         # 加入多次散射估计
         multi_scatter = monte_carlo_scattering(D, depths, scattering_coeff)
-        new_avg_cs = np.maximum((D * p) + (avg_cs_prime * (1 - p)) + multi_scatter, 0)
+        multi_scatter_iter = multi_scatter * (decay_factor ** iter_idx)
+        new_avg_cs = np.maximum((D * p) + (avg_cs_prime * (1 - p)) + multi_scatter_iter, 0)
         
         if np.max(np.abs((avg_cs - new_avg_cs) / (avg_cs + 1e-6))) < tol:
             break
