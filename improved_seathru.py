@@ -238,7 +238,7 @@ class ScatteringSimulator:
         # Physical parameters
         g = 0.8  # Asymmetry factor for water
         absorption_coeff = 0.5
-        energy_factor = 0.001
+        energy_factor = 0.005
         
         # Adaptive kernel size based on scattering coefficient
         kernel_size = min(int(scattering_coeff * 5), 11)
@@ -570,23 +570,23 @@ class UnderwaterImageEnhancer:
         Returns:
             Enhanced image
         """
-        # Apply white balance
-        balanced = self.apply_adaptive_white_balance(img)
+        # # Apply white balance
+        # balanced = self.apply_adaptive_white_balance(img)
         
-        # Apply CLAHE
-        clahe_result = self.apply_clahe(balanced)
+        # # Apply CLAHE
+        # clahe_result = self.apply_clahe(balanced)
         
-        # Apply gamma correction
-        gamma_result = self.apply_gamma_correction(balanced)
+        # # Apply gamma correction
+        # gamma_result = self.apply_gamma_correction(balanced)
         
-        # Blend results
-        enhanced = 0.7 * clahe_result + 0.3 * gamma_result
+        # # Blend results
+        # enhanced = 0.7 * clahe_result + 0.3 * gamma_result
         
-        # Final contrast adjustment
-        p2, p98 = np.percentile(enhanced, (2, 98))
-        enhanced = exposure.rescale_intensity(enhanced, in_range=(p2, p98))
+        # # Final contrast adjustment
+        # p2, p98 = np.percentile(enhanced, (2, 98))
+        # enhanced = exposure.rescale_intensity(enhanced, in_range=(p2, p98))
         
-        return np.clip(enhanced, 0, 1)
+        return np.clip(img, 0, 1)
 
 
 # ================================================================================
@@ -766,7 +766,7 @@ class UnderwaterImageRestoration:
         transmission = np.exp(-exponent)
         
         # Remove backscatter and correct attenuation
-        epsilon = 1e-6
+        epsilon = 1e-3
         direct_signal = (img - backscatter) / (transmission + epsilon)
         
         # Normalize and enhance
