@@ -1,1008 +1,1137 @@
-import collections
-import sys
+"""
+Underwater Image Enhancement using Improved SeaThru Algorithm
+
+This implementation provides a comprehensive framework for underwater image restoration
+based on physical models of light propagation in water. The algorithm addresses
+backscatter removal, illumination estimation, and attenuation correction.
+
+References:
+    - Akkaynak, D., & Treibitz, T. (2019). Sea-thru: A method for removing water from underwater images.
+    - Schechner, Y. Y., & Karpel, N. (2005). Recovery of underwater visibility and structure by polarization analysis.
+
+Author: [Your Name]
+Date: 2024
+"""
+
+# ================================================================================
+# Critical: Handle OpenMP conflicts before any scientific library imports
+# ================================================================================
+import os
+import platform
+
+# Resolve OpenMP conflicts on Windows
+if platform.system() == 'Windows':
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+# Set optimal thread counts
+if 'OMP_NUM_THREADS' not in os.environ:
+    import multiprocessing
+    num_cores = multiprocessing.cpu_count()
+    optimal_threads = str(max(1, min(num_cores - 2, 8)))  # Cap at 8 threads
+    os.environ['OMP_NUM_THREADS'] = optimal_threads
+    os.environ['MKL_NUM_THREADS'] = optimal_threads
+    os.environ['NUMEXPR_NUM_THREADS'] = optimal_threads
+
+# ================================================================================
+# Standard imports in specific order to minimize conflicts
+# ================================================================================
+import numpy as np  # Import NumPy first (often includes MKL)
 import cv2
-import argparse
-import numpy as np
-import sklearn as sk
 import scipy as sp
-import scipy.optimize
-import scipy.stats
-import math
-from PIL import Image
-import rawpy
-from cv2 import medianBlur
+import scipy.optimize as opt
+import scipy.stats as stats
+from scipy.optimize import differential_evolution, curve_fit
+
+# Import scikit-image components
 from skimage import exposure, restoration
-from skimage.restoration import denoise_bilateral, denoise_tv_chambolle, estimate_sigma
+from skimage.restoration import denoise_bilateral, denoise_tv_chambolle, denoise_wavelet
 from skimage.morphology import closing, opening, erosion, dilation, disk, diamond, square
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
-from UCIQE import getUCIQE
-import numpy as np
-import cv2
-from skimage import restoration
 
-import numpy as np
-import scipy as sp
-import cv2
-from scipy.optimize import differential_evolution, curve_fit
-from skopt import gp_minimize
-from skopt.space import Real
-#from pyswarm import pso
-
-
-def improved_backscatter_model(depth, B_inf, beta_B, gamma):
-    return B_inf * (1 - np.exp(-beta_B * depth**gamma))
-
-def find_backscatter_estimation_points(img, depths, num_bins=10, fraction=0.01, max_vals=20, min_depth_percent=0.0):
-    z_max, z_min = np.max(depths), np.min(depths)
-    min_depth = z_min + (min_depth_percent * (z_max - z_min))
-    z_ranges = np.linspace(z_min, z_max, num_bins + 1)
-    img_norms = np.mean(img, axis=2) if img.ndim == 3 else img
-    points = []
-    for i in range(len(z_ranges) - 1):
-        a, b = z_ranges[i], z_ranges[i+1]
-        locs = np.where(np.logical_and(depths > min_depth, np.logical_and(depths >= a, depths <= b)))
-        norms_in_range, px_in_range, depths_in_range = img_norms[locs], img[locs], depths[locs]
-        arr = sorted(zip(norms_in_range, px_in_range, depths_in_range), key=lambda x: x[0])
-        points.extend([(z, p) for n, p, z in arr[:min(math.ceil(fraction * len(arr)), max_vals)]])
-    return np.array(points)
-
-def find_backscatter_values_improved(B_pts, depths, wavelength, restarts=10):
-    B_vals, B_depths = B_pts[:, 1], B_pts[:, 0]
-    
-    def loss(B_inf, beta_B, gamma):
-        return np.mean(np.abs(B_vals - improved_backscatter_model(B_depths, B_inf, beta_B, gamma)))
-    
-    bounds_lower = [0, 0, 0.5]
-    bounds_upper = [1, 5, 2]
-    
-    best_loss = np.inf
-    best_params = None
-    
-    for _ in range(restarts):
-        try:
-            # 修改初始参数生成方式
-            p0 = bounds_lower + np.random.random(3) * (np.array(bounds_upper) - np.array(bounds_lower))
-            params, _ = sp.optimize.curve_fit(
-                improved_backscatter_model,
-                B_depths,
-                B_vals,
-                p0=p0,
-                bounds=(bounds_lower, bounds_upper)
-            )
-            current_loss = loss(*params)
-            if current_loss < best_loss:
-                best_loss = current_loss
-                best_params = params
-        except RuntimeError as re:
-            print(f"Optimization failed: {re}", file=sys.stderr)
-        except ValueError as ve:
-            print(f"Value error during optimization: {ve}", file=sys.stderr)
-    
-    if best_params is None:
-        print("Warning: Could not find accurate backscatter model. Using linear approximation.", flush=True)
-        slope, intercept, _, _, _ = sp.stats.linregress(B_depths, B_vals)
-        return lambda d: slope * d + intercept, np.array([slope, intercept, 1])  # 添加一个默认的 gamma 值
-    
-    return lambda d: improved_backscatter_model(d, *best_params), best_params
-
-
-import numpy as np
-import cv2
-
-def henvey_greenstein_phase_function(theta, g):
-    return (1 - g**2) / (1 + g**2 - 2 * g * np.cos(theta))**1.5
-
-
-def monte_carlo_scattering(D, depths, scattering_coeff):
-    """
-    蒙特卡洛散射模拟函数
-    
-    参数:
-        D: 直接信号（去除背散射后的图像）
-        depths: 深度图
-        scattering_coeff: 散射系数
-    
-    返回:
-        scattered_light: 散射光估计
-    """
-    # 确保depths是浮点类型，避免uint8溢出问题
-    depths_float = depths.astype(np.float32)
-    
-    # 定义亨尼-格林斯坦相函数参数
-    g = 0.8  # 不对称因子，水下环境通常取 0.8
-    energy_factor = 0.001  # 控制散射核的总能量
-    
-    # 调整吸收系数，避免过大的值导致数值问题
-    absorption_coeff = 0.5  # 从1.0降低到0.5，更合理的水体吸收系数
-
-    # 核的尺寸
-    kernel_size = min(int(scattering_coeff * 5), 11)  # 降低核大小上限
-    kernel_size = max(kernel_size, 3)  # 确保最小尺寸
-    if kernel_size % 2 == 0:
-        kernel_size += 1  # 确保为奇数
-
-    # 生成二维坐标网格
-    center = kernel_size // 2
-    x = np.arange(kernel_size) - center
-    y = np.arange(kernel_size) - center
-    xv, yv = np.meshgrid(x, y)
-    r = np.sqrt(xv**2 + yv**2) + 1e-5  # 防止除零
-
-    # 计算对应的散射角（小角度近似）
-    # 使用安全的深度均值计算
-    # depth_mean = np.mean(depths_float)
-    depth_mean = np.clip(np.mean(depths_float), 0.01, 10.0)
-
-    
-    theta = np.arctan(r / depth_mean)
-
-    # 计算散射核
-    phase_function = henvey_greenstein_phase_function(theta, g)
-    kernel = phase_function / (np.sum(phase_function) + 1e-5)  # 归一化，添加小值防止除零
-    kernel *= energy_factor  # 调整能量
-
-    # 对直接信号应用散射核
-    scattered_light = cv2.filter2D(D, -1, kernel)
-
-    # 加入深度依赖的衰减因子
-    # 使用安全的指数计算，避免数值溢出
-    exponent = -absorption_coeff * depths_float
-    # 限制指数范围，避免极端值
-    exponent = np.clip(exponent, -5, 0)
-    depth_attenuation = np.exp(exponent)
-    
-    scattered_light *= depth_attenuation
-
-    return scattered_light
-
-
-
-'''
-def monte_carlo_scattering(D, depths, scattering_coeff):
-    # 根据散射系数创建散射核
-    depth_weights = np.exp(-depths / np.mean(depths))
-    kernel_size = int(scattering_coeff * 10)
-    kernel_size = max(kernel_size, 3)  # 确保最小尺寸
-    kernel = cv2.getGaussianKernel(kernel_size, scattering_coeff)
-    kernel = kernel * kernel.T  # 创建二维高斯核
-    
-    # 对直接信号应用散射核
-    # scattered_light = cv2.filter2D(D, -1, kernel)
-    scattered_light = cv2.filter2D(D * depth_weights, -1, kernel)
-    return scattered_light
-'''
-
-def estimate_illumination_improved(img, B, depths, neighborhood_map, num_neighborhoods, scattering_coeff, p=0.5, f=2.0, max_iters=100, tol=1E-5):
-    epsilon = 1e-2
-    D = np.maximum(img - B, epsilon)
-
-    # D = np.maximum(img - B, 0)
-    avg_cs = D.copy()
-    avg_cs_prime = np.copy(avg_cs)
-    sizes = np.zeros(num_neighborhoods)
-    locs_list = [None] * num_neighborhoods
-    
-    for label in range(1, num_neighborhoods + 1):
-        locs_list[label - 1] = np.where(neighborhood_map == label)
-        sizes[label - 1] = np.size(locs_list[label - 1][0])
-    
-    decay_factor = 0.95   # 每次迭代的衰减因子
-    
-    for iter_idx in range(max_iters):
-        for label in range(1, num_neighborhoods + 1):
-            locs = locs_list[label - 1]
-            size = sizes[label - 1] - 1
-            avg_cs_prime[locs] = (np.sum(avg_cs[locs]) - avg_cs[locs]) / size
-        
-        # 加入多次散射估计
-        multi_scatter = monte_carlo_scattering(D, depths, scattering_coeff)
-        multi_scatter_iter = multi_scatter * (decay_factor ** iter_idx)
-        new_avg_cs = np.maximum((D * p) + (avg_cs_prime * (1 - p)) + multi_scatter_iter, 0)
-        
-        if np.max(np.abs((avg_cs - new_avg_cs) / (avg_cs + 1e-6))) < tol:
-            break
-        avg_cs = new_avg_cs
-    
-    return f * denoise_bilateral(avg_cs)
-
-
-def radiative_transfer_model(depth, a, b, c):
-    return np.exp(-(a + b) * depth) + c * (1 - np.exp(-b * depth))
-
-
-
-
-def beta_model(depths, a1, b1, a2, b2):
-    """
-    Double-exponential model for attenuation coefficient.
-
-    Parameters:
-    - depths (numpy.ndarray): Depth values.
-    - a1 (float): Parameter a1.
-    - b1 (float): Parameter b1.
-    - a2 (float): Parameter a2.
-    - b2 (float): Parameter b2.
-
-    Returns:
-    - numpy.ndarray: Computed attenuation coefficients.
-    """
-    return a1 * np.exp(-b1 * depths) + a2 * np.exp(-b2 * depths)
-
-def load_water_coefficients(water_type, wavelength):
-    """
-    Load absorption and scattering coefficients based on water type and wavelength.
-
-    Parameters:
-    - water_type (str): Type of water ('I', 'II', 'III').
-    - wavelength (int): Wavelength in nm.
-
-    Returns:
-    - tuple: (a, b) absorption and scattering coefficients.
-    """
-    water_types = {
-        'I': {'a': {400: 0.01, 500: 0.02, 600: 0.05}, 'b': {400: 0.03, 500: 0.02, 600: 0.01}},
-        'II': {'a': {400: 0.02, 500: 0.04, 600: 0.07}, 'b': {400: 0.05, 500: 0.04, 600: 0.03}},
-        'III': {'a': {400: 0.04, 500: 0.06, 600: 0.1}, 'b': {400: 0.08, 500: 0.07, 600: 0.05}},
-    }
-    known_wavelengths = [400, 500, 600]
-    closest_wavelength = min(known_wavelengths, key=lambda x: abs(x - wavelength))
-    water = water_types.get(water_type, water_types['II'])
-    a = water['a'][closest_wavelength]
-    b = water['b'][closest_wavelength]
-    return a, b
-
-def estimate_wideband_attenuation_improved(depths, illum, wavelength, water_type='I', method='differential_evolution', **kwargs):
-    """
-    Estimate wideband attenuation using a global optimization algorithm.
-
-    Parameters:
-    - depths (numpy.ndarray): Depth map.
-    - illum (numpy.ndarray): Illumination map.
-    - wavelength (int): Wavelength in nm.
-    - water_type (str): Type of water ('I', 'II', 'III').
-    - method (str): Optimization method ('differential_evolution', 'bayesian', 'pso').
-    - kwargs: Additional keyword arguments for the optimization method.
-
-    Returns:
-    - beta_smoothed (numpy.ndarray): Smoothed attenuation coefficient map.
-    """
-    # Load water coefficients
-    a, b = load_water_coefficients(water_type, wavelength)
-    beta_theoretical = a + b  # Theoretical attenuation coefficient
-
-    # Data preprocessing
-    depth_min = 0.1
-    depths_safe = np.clip(depths, depth_min, np.max(depths))
-    illum_safe = np.clip(illum, 0.01, 1.0)
-
-    # Initial empirical estimation
-    with np.errstate(divide='ignore'):
-        beta_empirical = -np.log(illum_safe) / depths_safe
-    beta_empirical = np.clip(beta_empirical, 0, 5.0)
-
-    # Data filtering
-    valid_mask = (illum > 0.01) & (depths > depth_min)
-    depths_valid = depths_safe[valid_mask]
-    beta_valid = beta_empirical[valid_mask]
-
-    if len(depths_valid) < 3:
-        print('Warning: Too few points for curve fitting. Using theoretical beta.', flush=True)
-        beta_final = beta_theoretical * np.ones_like(depths_safe)
-        return beta_final
-
-    # Define the loss function
-    def loss_func(params):
-        beta_estimated = beta_model(depths_valid, *params)
-        return np.mean((beta_valid - beta_estimated) ** 2)
-
-    # Optimization based on selected method
-    if method == 'differential_evolution':
-        bounds = [(0, 10), (0, 1), (0, 10), (0, 1)]
-        result = differential_evolution(loss_func, bounds=bounds, strategy='best1bin', **kwargs)
-        if result.success:
-            best_params = result.x
-            print(f"Optimization succeeded with loss {result.fun}", flush=True)
-        else:
-            print('Optimization failed. Using theoretical beta.', flush=True)
-            best_params = [0, 0, 0, 0]  # Default parameters
-    elif method == 'bayesian':
-        space = [Real(0, 10, name='a1'), Real(0, 1, name='b1'), Real(0, 10, name='a2'), Real(0, 1, name='b2')]
-        result = gp_minimize(loss_func, space, **kwargs)
-        if result.fun is not None:
-            best_params = result.x
-            print(f"Optimization succeeded with loss {result.fun}", flush=True)
-        else:
-            print('Optimization failed. Using theoretical beta.', flush=True)
-            best_params = [0, 0, 0, 0]
-    #elif method == 'pso':
-    #    lb = [0, 0, 0, 0]
-    #    ub = [10, 1, 10, 1]
-    #    best_params, best_loss = pso(loss_func, lb, ub, **kwargs)
-    #    print(f"Optimization {'succeeded' if best_params is not None else 'failed'} with loss {best_loss}", flush=True)
-    else:
-        raise ValueError("Unsupported optimization method.")
-
-    # Apply the model with best parameters
-    if method in ['differential_evolution', 'bayesian', 'pso']:
-        beta_final = beta_model(depths_safe, *best_params)
-    else:
-        beta_final = beta_theoretical * np.ones_like(depths_safe)
-    
-    beta_final = np.clip(beta_final, 0, None)
-
-    # Filtering and smoothing
-    beta_smoothed = cv2.medianBlur(beta_final.astype(np.float32), 5)
-    beta_smoothed = cv2.bilateralFilter(beta_smoothed, 9, 75, 75)
-    beta_smoothed = cv2.edgePreservingFilter(beta_smoothed.astype(np.float32), flags=1, sigma_s=60, sigma_r=0.4)
-
-    return beta_smoothed
-
-
-
-def post_process(img):
-    # 去噪
-    denoised = restoration.denoise_wavelet(img, channel_axis=-1, convert2ycbcr=True, method='BayesShrink')
-    
-    # 自适应对比度增强
-    p2, p98 = np.percentile(denoised, (2, 98))
-    enhanced = exposure.rescale_intensity(denoised, in_range=(p2, p98))
-    
-    # 温和的色彩平衡
-    #balanced = color_balance(enhanced, strength=0.5)
-    
-    return enhanced
-
-import cv2
-import numpy as np
-from skimage import exposure
-from skimage.color import rgb2lab, lab2rgb
+# Other imports
+import collections
+from typing import Tuple, Dict, Callable, Optional
+import argparse
+import sys
+import matplotlib.pyplot as plt
+from PIL import Image
 import warnings
 warnings.filterwarnings('ignore')
 
-class EnhancementProcessor:
+
+# ================================================================================
+# Physical Models for Underwater Light Propagation
+# ================================================================================
+
+class BackscatterModel:
     """
-    Underwater Image Enhancement Processor
-    实现自适应白平衡和图像增强的集成处理
+    Implementation of the improved backscatter model for underwater images.
+    
+    The backscatter component is modeled as:
+    B(z) = B_inf * (1 - exp(-beta_B * z^gamma))
+    
+    where:
+        - B_inf: asymptotic backscatter value
+        - beta_B: backscatter coefficient
+        - gamma: non-linear depth dependency factor
+        - z: depth
     """
     
-    def __init__(self, 
-                 clahe_clip_limit=1.5,
-                 clahe_grid_size=(8, 8),
-                 gamma=1.15,
-                 alpha=0.7,
-                 beta=0.6,
-                 white_balance_method='adaptive'):
+    @staticmethod
+    def compute(depth: np.ndarray, B_inf: float, beta_B: float, gamma: float) -> np.ndarray:
         """
-        初始化增强处理器
+        Compute backscatter values for given depths.
         
         Args:
-            clahe_clip_limit: CLAHE对比度限制
-            clahe_grid_size: CLAHE网格大小
-            gamma: gamma校正值
-            alpha: CLAHE结果权重
-            beta: gamma校正结果权重
-            white_balance_method: 白平衡方法 ['gray_world', 'retinex', 'shades_of_gray', 'adaptive']
+            depth: Depth map (2D array)
+            B_inf: Asymptotic backscatter value
+            beta_B: Backscatter coefficient
+            gamma: Non-linear depth dependency factor
+            
+        Returns:
+            Backscatter values
+        """
+        return B_inf * (1 - np.exp(-beta_B * depth**gamma))
+    
+    @staticmethod
+    def find_estimation_points(img_channel: np.ndarray, depths: np.ndarray, 
+                             num_bins: int = 10, fraction: float = 0.01, 
+                             max_vals: int = 20) -> np.ndarray:
+        """
+        Find points for backscatter estimation using dark channel prior.
+        
+        Args:
+            img_channel: Single channel image
+            depths: Depth map
+            num_bins: Number of depth bins
+            fraction: Fraction of darkest pixels to select
+            max_vals: Maximum values per bin
+            
+        Returns:
+            Array of (depth, intensity) pairs
+        """
+        z_max, z_min = np.max(depths), np.min(depths)
+        z_ranges = np.linspace(z_min, z_max, num_bins + 1)
+        
+        points = []
+        for i in range(len(z_ranges) - 1):
+            # Select pixels in current depth range
+            mask = (depths >= z_ranges[i]) & (depths <= z_ranges[i+1])
+            
+            if not np.any(mask):
+                continue
+                
+            # Get pixels and depths in range
+            pixels_in_range = img_channel[mask]
+            depths_in_range = depths[mask]
+            
+            # Sort by intensity and select darkest pixels
+            sorted_indices = np.argsort(pixels_in_range)
+            n_select = min(int(np.ceil(fraction * len(pixels_in_range))), max_vals)
+            
+            for idx in sorted_indices[:n_select]:
+                points.append((depths_in_range[idx], pixels_in_range[idx]))
+        
+        return np.array(points)
+    
+    @staticmethod
+    def estimate_parameters(B_pts: np.ndarray, restarts: int = 10) -> Tuple[Callable, np.ndarray]:
+        """
+        Estimate backscatter model parameters using robust optimization.
+        
+        Args:
+            B_pts: Array of (depth, intensity) pairs
+            restarts: Number of random restarts for optimization
+            
+        Returns:
+            Tuple of (backscatter function, parameters)
+        """
+        if len(B_pts) < 3:
+            # Fallback to linear model if insufficient points
+            return lambda d: 0.0, np.array([0.0, 0.0, 1.0])
+        
+        B_depths, B_vals = B_pts[:, 0], B_pts[:, 1]
+        
+        # Define bounds for parameters
+        bounds_lower = [0, 0, 0.5]
+        bounds_upper = [1, 5, 2]
+        
+        best_loss = np.inf
+        best_params = None
+        
+        # Multiple random restarts for robustness
+        for _ in range(restarts):
+            try:
+                # Random initialization
+                p0 = bounds_lower + np.random.random(3) * (np.array(bounds_upper) - np.array(bounds_lower))
+                
+                # Curve fitting
+                params, _ = curve_fit(
+                    BackscatterModel.compute,
+                    B_depths,
+                    B_vals,
+                    p0=p0,
+                    bounds=(bounds_lower, bounds_upper),
+                    maxfev=5000
+                )
+                
+                # Compute loss
+                loss = np.mean(np.abs(B_vals - BackscatterModel.compute(B_depths, *params)))
+                
+                if loss < best_loss:
+                    best_loss = loss
+                    best_params = params
+                    
+            except (RuntimeError, ValueError):
+                continue
+        
+        if best_params is None:
+            # Fallback to linear approximation
+            slope, intercept = np.polyfit(B_depths, B_vals, 1)
+            return lambda d: np.clip(slope * d + intercept, 0, 1), np.array([intercept, slope, 1.0])
+        
+        return lambda d: BackscatterModel.compute(d, *best_params), best_params
+
+
+# ================================================================================
+# Scattering Simulation
+# ================================================================================
+
+class ScatteringSimulator:
+    """
+    Monte Carlo simulation of light scattering in water using the 
+    Henyey-Greenstein phase function.
+    """
+    
+    @staticmethod
+    def henyey_greenstein_phase_function(theta: np.ndarray, g: float) -> np.ndarray:
+        """
+        Compute the Henyey-Greenstein phase function.
+        
+        Args:
+            theta: Scattering angle (radians)
+            g: Asymmetry parameter (-1 to 1, typically 0.8 for water)
+            
+        Returns:
+            Phase function values
+        """
+        return (1 - g**2) / (1 + g**2 - 2 * g * np.cos(theta))**1.5
+    
+    @staticmethod
+    def monte_carlo_scattering(direct_signal: np.ndarray, depths: np.ndarray, 
+                              scattering_coeff: float) -> np.ndarray:
+        """
+        Simulate forward scattering effects using Monte Carlo approach.
+        
+        Args:
+            direct_signal: Direct transmission component
+            depths: Depth map
+            scattering_coeff: Scattering coefficient
+            
+        Returns:
+            Scattered light estimation
+        """
+        # Ensure float type for numerical stability
+        depths_float = depths.astype(np.float32)
+        
+        # Physical parameters
+        g = 0.8  # Asymmetry factor for water
+        absorption_coeff = 0.5
+        energy_factor = 0.001
+        
+        # Adaptive kernel size based on scattering coefficient
+        kernel_size = min(int(scattering_coeff * 5), 11)
+        kernel_size = max(kernel_size, 3)
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        
+        # Create spatial kernel
+        center = kernel_size // 2
+        y, x = np.ogrid[-center:kernel_size-center, -center:kernel_size-center]
+        r = np.sqrt(x**2 + y**2) + 1e-5
+        
+        # Compute scattering angles
+        depth_mean = np.clip(np.mean(depths_float), 0.01, 10.0)
+        theta = np.arctan(r / depth_mean)
+        
+        # Apply phase function
+        phase_values = ScatteringSimulator.henyey_greenstein_phase_function(theta, g)
+        kernel = phase_values / (np.sum(phase_values) + 1e-5)
+        kernel *= energy_factor
+        
+        # Convolve with direct signal
+        scattered_light = cv2.filter2D(direct_signal, -1, kernel)
+        
+        # Apply depth-dependent attenuation
+        exponent = np.clip(-absorption_coeff * depths_float, -5, 0)
+        depth_attenuation = np.exp(exponent)
+        scattered_light *= depth_attenuation
+        
+        return scattered_light
+
+
+# ================================================================================
+# Illumination Estimation
+# ================================================================================
+
+class IlluminationEstimator:
+    """
+    Estimate the illumination map using neighborhood-based optimization
+    with forward scattering compensation.
+    """
+    
+    @staticmethod
+    def estimate(img_channel: np.ndarray, backscatter: np.ndarray, 
+                depths: np.ndarray, neighborhood_map: np.ndarray, 
+                num_neighborhoods: int, scattering_coeff: float,
+                p: float = 0.5, f: float = 2.0, 
+                max_iters: int = 100, tol: float = 1e-5) -> np.ndarray:
+        """
+        Iteratively estimate illumination map.
+        
+        Args:
+            img_channel: Single channel image
+            backscatter: Backscatter component
+            depths: Depth map
+            neighborhood_map: Segmented depth neighborhoods
+            num_neighborhoods: Number of neighborhoods
+            scattering_coeff: Scattering coefficient
+            p: Mixing parameter (0-1)
+            f: Amplification factor
+            max_iters: Maximum iterations
+            tol: Convergence tolerance
+            
+        Returns:
+            Estimated illumination map
+        """
+        # Initialize with direct transmission
+        epsilon = 1e-6
+        direct_signal = np.maximum(img_channel - backscatter, epsilon)
+        
+        # Prepare neighborhood information
+        avg_illum = direct_signal.copy()
+        avg_illum_neighbor = np.copy(avg_illum)
+        
+        # Precompute neighborhood locations and sizes
+        locs_list = []
+        sizes = []
+        for label in range(1, num_neighborhoods + 1):
+            locs = np.where(neighborhood_map == label)
+            locs_list.append(locs)
+            sizes.append(len(locs[0]))
+        
+        # Iterative refinement
+        decay_factor = 0.95
+        
+        for iter_idx in range(max_iters):
+            # Update neighborhood averages
+            for i, (locs, size) in enumerate(zip(locs_list, sizes)):
+                if size > 1:
+                    neighborhood_sum = np.sum(avg_illum[locs])
+                    avg_illum_neighbor[locs] = (neighborhood_sum - avg_illum[locs]) / (size - 1)
+            
+            # Incorporate forward scattering
+            scattered = ScatteringSimulator.monte_carlo_scattering(
+                direct_signal, depths, scattering_coeff
+            )
+            scattered_iter = scattered * (decay_factor ** iter_idx)
+            
+            # Update illumination estimate
+            new_avg_illum = np.maximum(
+                direct_signal * p + avg_illum_neighbor * (1 - p) + scattered_iter, 
+                0
+            )
+            
+            # Check convergence
+            relative_change = np.max(np.abs(avg_illum - new_avg_illum) / (avg_illum + epsilon))
+            if relative_change < tol:
+                break
+                
+            avg_illum = new_avg_illum
+        
+        # Apply bilateral filtering for edge preservation
+        return f * denoise_bilateral(avg_illum, sigma_color=0.1, sigma_spatial=15)
+
+
+# ================================================================================
+# Attenuation Estimation
+# ================================================================================
+
+class AttenuationEstimator:
+    """
+    Estimate wavelength-dependent attenuation coefficients using
+    physical models and optimization.
+    """
+    
+    # Water optical properties (absorption + scattering coefficients)
+    WATER_PROPERTIES = {
+        'I': {   # Clear ocean water
+            'a': {450: 0.015, 550: 0.035, 650: 0.065},
+            'b': {450: 0.032, 550: 0.020, 650: 0.010}
+        },
+        'II': {  # Coastal water
+            'a': {450: 0.020, 550: 0.040, 650: 0.070},
+            'b': {450: 0.050, 550: 0.040, 650: 0.030}
+        },
+        'III': { # Turbid harbor water
+            'a': {450: 0.040, 550: 0.060, 650: 0.100},
+            'b': {450: 0.080, 550: 0.070, 650: 0.050}
+        }
+    }
+    
+    @staticmethod
+    def beta_model(depths: np.ndarray, a1: float, b1: float, 
+                   a2: float, b2: float) -> np.ndarray:
+        """
+        Double-exponential model for depth-dependent attenuation.
+        
+        Args:
+            depths: Depth values
+            a1, b1, a2, b2: Model parameters
+            
+        Returns:
+            Attenuation coefficients
+        """
+        return a1 * np.exp(-b1 * depths) + a2 * np.exp(-b2 * depths)
+    
+    @staticmethod
+    def estimate_wideband_attenuation(depths: np.ndarray, illumination: np.ndarray,
+                                     wavelength: int, water_type: str = 'II') -> np.ndarray:
+        """
+        Estimate attenuation coefficient map using optimization.
+        
+        Args:
+            depths: Depth map
+            illumination: Illumination map
+            wavelength: Wavelength in nm
+            water_type: Water type ('I', 'II', or 'III')
+            
+        Returns:
+            Smoothed attenuation coefficient map
+        """
+        # Get theoretical coefficients
+        water_props = AttenuationEstimator.WATER_PROPERTIES.get(water_type, 
+                                                                AttenuationEstimator.WATER_PROPERTIES['II'])
+        
+        # Find closest wavelength
+        available_wavelengths = list(water_props['a'].keys())
+        closest_wavelength = min(available_wavelengths, key=lambda x: abs(x - wavelength))
+        
+        a_coeff = water_props['a'][closest_wavelength]
+        b_coeff = water_props['b'][closest_wavelength]
+        beta_theoretical = a_coeff + b_coeff
+        
+        # Prepare data
+        depth_min = 0.1
+        depths_safe = np.clip(depths, depth_min, None)
+        illum_safe = np.clip(illumination, 0.01, 1.0)
+        
+        # Empirical estimation
+        with np.errstate(divide='ignore', invalid='ignore'):
+            beta_empirical = -np.log(illum_safe) / depths_safe
+        beta_empirical = np.nan_to_num(beta_empirical, nan=beta_theoretical)
+        beta_empirical = np.clip(beta_empirical, 0, 5.0)
+        
+        # Filter valid data points
+        valid_mask = (illumination > 0.01) & (depths > depth_min)
+        depths_valid = depths_safe[valid_mask]
+        beta_valid = beta_empirical[valid_mask]
+        
+        if len(depths_valid) < 10:
+            # Use theoretical model if insufficient data
+            beta_final = beta_theoretical * np.ones_like(depths_safe)
+        else:
+            # Optimize double-exponential model
+            def loss_func(params):
+                beta_est = AttenuationEstimator.beta_model(depths_valid, *params)
+                return np.mean((beta_valid - beta_est)**2)
+            
+            # Global optimization
+            bounds = [(0, 10), (0, 1), (0, 10), (0, 1)]
+            result = differential_evolution(loss_func, bounds, seed=42, maxiter=300)
+            
+            if result.success:
+                beta_final = AttenuationEstimator.beta_model(depths_safe, *result.x)
+            else:
+                beta_final = beta_theoretical * np.ones_like(depths_safe)
+        
+        # Spatial smoothing with edge preservation
+        beta_smoothed = cv2.medianBlur(beta_final.astype(np.float32), 5)
+        beta_smoothed = cv2.bilateralFilter(beta_smoothed, 9, 75, 75)
+        
+        return beta_smoothed
+
+
+# ================================================================================
+# Image Enhancement
+# ================================================================================
+
+class UnderwaterImageEnhancer:
+    """
+    Post-processing enhancement for underwater images using
+    adaptive white balance and contrast enhancement.
+    """
+    
+    def __init__(self, clahe_clip_limit: float = 1.5,
+                 clahe_grid_size: Tuple[int, int] = (8, 8),
+                 gamma: float = 1.15):
+        """
+        Initialize the image enhancer.
+        
+        Args:
+            clahe_clip_limit: CLAHE clip limit
+            clahe_grid_size: CLAHE grid size
+            gamma: Gamma correction value
         """
         self.clahe = cv2.createCLAHE(
             clipLimit=clahe_clip_limit,
             tileGridSize=clahe_grid_size
         )
         self.gamma = gamma
-        self.alpha = alpha
-        self.beta = beta
-        self.white_balance_method = white_balance_method
     
-    def _normalize_image(self, img):
+    def apply_adaptive_white_balance(self, img: np.ndarray) -> np.ndarray:
         """
-        规范化图像格式，确保数据类型一致性
-        """
-        # 处理数据类型
-        if img.dtype == np.float64:
-            img = img.astype(np.float32)
+        Apply gray world white balance assumption.
         
-        # 处理值范围
-        if img.max() <= 1.0:
-            img = (img * 255).astype(np.uint8)
-        elif img.dtype != np.uint8:
-            img = np.clip(img, 0, 255).astype(np.uint8)
-        
-        return img
-    
-    def _restore_format(self, img, original):
+        Args:
+            img: Input image (RGB, 0-1 range)
+            
+        Returns:
+            White balanced image
         """
-        还原到原始图像格式，确保数据类型一致性
-        """
-        if original.dtype in [np.float32, np.float64] and original.max() <= 1.0:
-            img = img.astype(np.float32) / 255.0
-            if original.dtype == np.float64:
-                img = img.astype(np.float64)
-        return img
-    
-    def apply_gray_world(self, img):
-        """
-        应用灰度世界假设的白平衡
-        确保所有通道数据类型一致
-        """
-        img = self._normalize_image(img)  # 确保输入是uint8类型
+        # Convert to LAB color space
+        img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
         
-        # 转换到LAB空间
-        img_lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(img_lab)
-        
-        # 确保所有通道都是相同的数据类型
-        l = l.astype(np.float32)
-        a = a.astype(np.float32)
-        b = b.astype(np.float32)
-        
-        # 计算均值
+        # Apply gray world assumption
         l_mean = np.mean(l)
         a_mean = np.mean(a)
         b_mean = np.mean(b)
         
-        # 调整a和b通道
-        a = a - ((a_mean - 128) * (l_mean / 128.0))
-        b = b - ((b_mean - 128) * (l_mean / 128.0))
+        # Adjust color channels
+        a = a.astype(np.float32) - (a_mean - 128) * (l_mean / 128.0)
+        b = b.astype(np.float32) - (b_mean - 128) * (l_mean / 128.0)
         
-        # 确保值在有效范围内
+        # Clip and convert back
         a = np.clip(a, 0, 255).astype(np.uint8)
         b = np.clip(b, 0, 255).astype(np.uint8)
-        l = np.clip(l, 0, 255).astype(np.uint8)
         
-        # 合并通道并转换回RGB
         balanced_lab = cv2.merge([l, a, b])
         balanced_rgb = cv2.cvtColor(balanced_lab, cv2.COLOR_LAB2RGB)
         
-        return balanced_rgb
+        return balanced_rgb.astype(np.float32) / 255.0
     
-    def apply_retinex(self, img):
+    def apply_clahe(self, img: np.ndarray) -> np.ndarray:
         """
-        应用Retinex理论的自适应白平衡
-        确保数据类型一致性
-        """
-        img = self._normalize_image(img)
+        Apply CLAHE to the luminance channel.
         
-        # 转换为浮点数进行计算
-        img_float = img.astype(np.float32)
-        r, g, b = cv2.split(img_float)
-        
-        # 计算对数域
-        r_log = np.log1p(r)
-        g_log = np.log1p(g)
-        b_log = np.log1p(b)
-        
-        # 计算均值和增益
-        r_mean = np.mean(r_log)
-        g_mean = np.mean(g_log)
-        b_mean = np.mean(b_log)
-        avg_mean = (r_mean + g_mean + b_mean) / 3
-        
-        # 计算增益系数
-        r_gain = avg_mean / (r_mean + np.finfo(float).eps)
-        g_gain = avg_mean / (g_mean + np.finfo(float).eps)
-        b_gain = avg_mean / (b_mean + np.finfo(float).eps)
-        
-        # 应用增益
-        r_balanced = np.expm1(r_log * r_gain)
-        g_balanced = np.expm1(g_log * g_gain)
-        b_balanced = np.expm1(b_log * b_gain)
-        
-        # 合并通道前确保数据类型一致
-        r_balanced = np.clip(r_balanced, 0, 255).astype(np.uint8)
-        g_balanced = np.clip(g_balanced, 0, 255).astype(np.uint8)
-        b_balanced = np.clip(b_balanced, 0, 255).astype(np.uint8)
-        
-        return cv2.merge([r_balanced, g_balanced, b_balanced])
-    
-    def apply_shades_of_gray(self, img, minkowski_norm=6):
-        """
-        应用灰度阴影的白平衡
-        确保数据类型一致性
-        """
-        img = self._normalize_image(img)
-        
-        # 转换为浮点数进行计算
-        img_float = img.astype(np.float32) / 255.0
-        r, g, b = cv2.split(img_float)
-        
-        # 计算Minkowski范数
-        r_norm = np.power(np.mean(np.power(r, minkowski_norm) + np.finfo(float).eps), 1/minkowski_norm)
-        g_norm = np.power(np.mean(np.power(g, minkowski_norm) + np.finfo(float).eps), 1/minkowski_norm)
-        b_norm = np.power(np.mean(np.power(b, minkowski_norm) + np.finfo(float).eps), 1/minkowski_norm)
-        
-        # 计算增益系数
-        gains = np.sqrt(1/(3 * np.array([r_norm, g_norm, b_norm]) + np.finfo(float).eps))
-        gains = gains / (np.max(gains) + np.finfo(float).eps)
-        
-        # 应用增益并确保数据类型一致
-        r_balanced = np.clip(r * gains[0] * 255, 0, 255).astype(np.uint8)
-        g_balanced = np.clip(g * gains[1] * 255, 0, 255).astype(np.uint8)
-        b_balanced = np.clip(b * gains[2] * 255, 0, 255).astype(np.uint8)
-        
-        return cv2.merge([r_balanced, g_balanced, b_balanced])
-    
-    def evaluate_color_cast(self, img):
-        """
-        评估图像的色偏程度
-        返回评分（越高越好）
-        """
-        img = self._normalize_image(img)
-        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-        l, a, b = cv2.split(lab)
-        
-        # 计算色彩统计特征
-        a_std = np.std(a)
-        b_std = np.std(b)
-        a_deviation = abs(np.mean(a) - 128)
-        b_deviation = abs(np.mean(b) - 128)
-        
-        # 计算综合得分
-        score = (a_std + b_std) / (a_deviation + b_deviation + 1e-6)
-        return score
-    
-    def apply_white_balance(self, img):
-        """
-        应用自适应白平衡
-        """
-        try:
-            img = self._normalize_image(img)
+        Args:
+            img: Input image (RGB, 0-1 range)
             
-            if self.white_balance_method == 'gray_world':
-                return self.apply_gray_world(img)
-            elif self.white_balance_method == 'retinex':
-                return self.apply_retinex(img)
-            elif self.white_balance_method == 'shades_of_gray':
-                return self.apply_shades_of_gray(img)
-            else:
-                # 自适应选择最佳白平衡方法
-                methods = {
-                    'gray_world': self.apply_gray_world,
-                    'retinex': self.apply_retinex,
-                    'shades_of_gray': self.apply_shades_of_gray
-                }
-                
-                results = {}
-                scores = {}
-                
-                for name, method in methods.items():
-                    try:
-                        balanced = method(img)
-                        score = self.evaluate_color_cast(balanced)
-                        results[name] = balanced
-                        scores[name] = score
-                    except Exception as e:
-                        print(f"Method {name} failed: {str(e)}")
-                        continue
-                
-                if not scores:
-                    print("All white balance methods failed, returning original image")
-                    return img
-                
-                best_method = max(scores.items(), key=lambda x: x[1])[0]
-                return results[best_method]
-                
-        except Exception as e:
-            print(f"White balance failed: {str(e)}")
-            return img  # 如果处理失败，返回原始图像
-    
-    def apply_clahe(self, img):
+        Returns:
+            Enhanced image
         """
-        应用CLAHE增强
-        使用LAB色彩空间保持色彩平衡
-        """
-        img = self._normalize_image(img)
-        
-        # 转换到LAB色彩空间
-        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        # Convert to LAB
+        img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
+        lab = cv2.cvtColor(img_uint8, cv2.COLOR_RGB2LAB)
         l, a, b = cv2.split(lab)
         
-        # 应用CLAHE到L通道
+        # Apply CLAHE to L channel
         l_clahe = self.clahe.apply(l)
         
-        # 合并通道并转换回RGB
+        # Merge and convert back
         enhanced_lab = cv2.merge([l_clahe, a, b])
         enhanced_rgb = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
         
-        return enhanced_rgb
+        return enhanced_rgb.astype(np.float32) / 255.0
     
-    def apply_adaptive_gamma(self, img):
+    def apply_gamma_correction(self, img: np.ndarray) -> np.ndarray:
         """
-        应用自适应gamma校正
-        使用局部亮度信息调整gamma值
+        Apply adaptive gamma correction.
+        
+        Args:
+            img: Input image (RGB, 0-1 range)
+            
+        Returns:
+            Gamma corrected image
         """
-        img = self._normalize_image(img)
-        
-        # 转换到HSV空间
-        hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-        v = hsv[:,:,2]
-        
-        # 计算局部亮度
-        local_mean = cv2.GaussianBlur(v, (15,15), 0)
-        
-        # 创建自适应gamma map
-        gamma_map = np.ones_like(v, dtype=np.float32) * self.gamma
-        gamma_map[local_mean > 128] = 1.0 + (self.gamma - 1.0) * 0.5
-        
-        # 应用gamma校正
-        corrected = np.power(v / 255.0, 1.0 / gamma_map) * 255.0
-        corrected = np.clip(corrected, 0, 255).astype(np.uint8)
-        
-        # 更新V通道
-        hsv[:,:,2] = corrected
-        
-        # 转换回RGB
-        return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+        # Apply gamma correction
+        return np.power(np.clip(img, 0, 1), 1.0 / self.gamma)
     
-    def enhance(self, image):
+    def enhance(self, img: np.ndarray) -> np.ndarray:
         """
-        完整的图像增强流程
+        Apply full enhancement pipeline.
+        
+        Args:
+            img: Input image (RGB, 0-1 range)
+            
+        Returns:
+            Enhanced image
         """
-        try:
-            # 保存原始格式供后续还原
-            original_format = image.copy()
-            
-            # 规范化图像格式
-            img = self._normalize_image(image)
-            
-            # 1. 应用自适应白平衡
-            balanced = self.apply_white_balance(img)
-            
-            # 2. 应用CLAHE增强
-            clahe_result = self.apply_clahe(balanced)
-            
-            # 3. 应用自适应gamma校正
-            gamma_result = self.apply_adaptive_gamma(balanced)
-            
-            # 4. 融合结果
-            enhanced = cv2.addWeighted(
-                clahe_result, self.alpha,
-                gamma_result, self.beta,
-                0
-            )
-            
-            # 还原到原始格式
-            enhanced = self._restore_format(enhanced, original_format)
-            
-            return enhanced
-            
-        except Exception as e:
-            print(f"Enhancement failed: {str(e)}")
-            return image  # 如果处理失败，返回原始图像
+        # Apply white balance
+        balanced = self.apply_adaptive_white_balance(img)
+        
+        # Apply CLAHE
+        clahe_result = self.apply_clahe(balanced)
+        
+        # Apply gamma correction
+        gamma_result = self.apply_gamma_correction(balanced)
+        
+        # Blend results
+        enhanced = 0.7 * clahe_result + 0.3 * gamma_result
+        
+        # Final contrast adjustment
+        p2, p98 = np.percentile(enhanced, (2, 98))
+        enhanced = exposure.rescale_intensity(enhanced, in_range=(p2, p98))
+        
+        return np.clip(enhanced, 0, 1)
 
-def process_image(image, 
-                 clahe_clip_limit=1.5,
-                 clahe_grid_size=(8, 8),
-                 gamma=1.15,
-                 alpha=0.7,
-                 beta=0.6,
-                 white_balance_method='adaptive'):
+
+# ================================================================================
+# Neighborhood Map Construction
+# ================================================================================
+
+class NeighborhoodMapper:
     """
-    便捷的处理函数
+    Construct and refine depth-based neighborhood maps for spatial processing.
+    """
+    
+    @staticmethod
+    def construct_neighborhood_map(depths: np.ndarray, epsilon: float = 0.05) -> Tuple[np.ndarray, int]:
+        """
+        Segment depth map into neighborhoods using region growing.
+        
+        Args:
+            depths: Depth map
+            epsilon: Relative depth tolerance
+            
+        Returns:
+            Tuple of (neighborhood map, number of neighborhoods)
+        """
+        eps = (np.max(depths) - np.min(depths)) * epsilon
+        nmap = np.zeros_like(depths, dtype=np.int32)
+        n_neighborhoods = 0
+        
+        # Region growing
+        while np.any(nmap == 0):
+            # Find unassigned pixel
+            locs_y, locs_x = np.where(nmap == 0)
+            start_idx = np.random.randint(0, len(locs_x))
+            start_y, start_x = locs_y[start_idx], locs_x[start_idx]
+            
+            n_neighborhoods += 1
+            
+            # BFS for region growing
+            queue = collections.deque([(start_y, start_x)])
+            start_depth = depths[start_y, start_x]
+            
+            while queue:
+                y, x = queue.popleft()
+                
+                if nmap[y, x] != 0:
+                    continue
+                
+                if np.abs(depths[y, x] - start_depth) <= eps:
+                    nmap[y, x] = n_neighborhoods
+                    
+                    # Add neighbors
+                    for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                        ny, nx = y + dy, x + dx
+                        if 0 <= ny < depths.shape[0] and 0 <= nx < depths.shape[1]:
+                            if nmap[ny, nx] == 0:
+                                queue.append((ny, nx))
+        
+        return nmap, n_neighborhoods
+    
+    @staticmethod
+    def refine_neighborhood_map(nmap: np.ndarray, min_size: int = 50, 
+                               radius: int = 3) -> Tuple[np.ndarray, int]:
+        """
+        Refine neighborhood map by merging small regions.
+        
+        Args:
+            nmap: Initial neighborhood map
+            min_size: Minimum region size
+            radius: Morphological closing radius
+            
+        Returns:
+            Tuple of (refined map, number of neighborhoods)
+        """
+        # Count region sizes
+        unique_labels, counts = np.unique(nmap[nmap > 0], return_counts=True)
+        
+        # Relabel large regions
+        refined_nmap = np.zeros_like(nmap)
+        new_label = 1
+        
+        for label, size in zip(unique_labels, counts):
+            if size >= min_size:
+                refined_nmap[nmap == label] = new_label
+                new_label += 1
+        
+        # Merge small regions into nearest neighbors
+        for label, size in zip(unique_labels, counts):
+            if size < min_size and label > 0:
+                mask = (nmap == label)
+                # Find nearest labeled pixel
+                for y, x in zip(*np.where(mask)):
+                    refined_nmap[y, x] = NeighborhoodMapper._find_nearest_label(
+                        refined_nmap, y, x
+                    )
+        
+        # Morphological closing
+        refined_nmap = closing(refined_nmap, square(radius))
+        
+        return refined_nmap, new_label - 1
+    
+    @staticmethod
+    def _find_nearest_label(nmap: np.ndarray, y: int, x: int) -> int:
+        """Find nearest non-zero label using BFS."""
+        visited = set()
+        queue = collections.deque([(y, x)])
+        
+        while queue:
+            cy, cx = queue.popleft()
+            
+            if (cy, cx) in visited:
+                continue
+            visited.add((cy, cx))
+            
+            if 0 <= cy < nmap.shape[0] and 0 <= cx < nmap.shape[1]:
+                if nmap[cy, cx] > 0:
+                    return nmap[cy, cx]
+                
+                for dy, dx in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                    queue.append((cy + dy, cx + dx))
+        
+        return 0
+
+
+# ================================================================================
+# Main Pipeline
+# ================================================================================
+
+class UnderwaterImageRestoration:
+    """
+    Main pipeline for underwater image restoration using the improved SeaThru algorithm.
+    """
+    
+    def __init__(self, water_type: str = 'II'):
+        """
+        Initialize the restoration pipeline.
+        
+        Args:
+            water_type: Type of water ('I', 'II', or 'III')
+        """
+        self.water_type = water_type
+        self.enhancer = UnderwaterImageEnhancer()
+        
+    def preprocess_depth_map(self, depths: np.ndarray) -> np.ndarray:
+        """
+        Smooth and preprocess depth map.
+        
+        Args:
+            depths: Raw depth map
+            
+        Returns:
+            Processed depth map
+        """
+        # Edge-preserving smoothing
+        return cv2.edgePreservingFilter(
+            depths.astype(np.float32), 
+            flags=1, 
+            sigma_s=5, 
+            sigma_r=0.1
+        )
+    
+    def recover_image(self, img: np.ndarray, depths: np.ndarray, 
+                     backscatter: np.ndarray, beta: np.ndarray) -> np.ndarray:
+        """
+        Recover the scene radiance from the underwater image.
+        
+        Args:
+            img: Input underwater image
+            depths: Depth map
+            backscatter: Estimated backscatter
+            beta: Attenuation coefficients
+            
+        Returns:
+            Recovered image
+        """
+        # Compute transmission
+        max_exponent = 5
+        exponent = np.clip(beta * np.expand_dims(depths, axis=2), 0, max_exponent)
+        transmission = np.exp(-exponent)
+        
+        # Remove backscatter and correct attenuation
+        epsilon = 1e-6
+        direct_signal = (img - backscatter) / (transmission + epsilon)
+        
+        # Normalize and enhance
+        direct_signal = np.clip(direct_signal, 0, None)
+        
+        # Scale to 0-1 range
+        for c in range(3):
+            channel = direct_signal[:, :, c]
+            p1, p99 = np.percentile(channel, (1, 99))
+            if p99 > p1:
+                direct_signal[:, :, c] = (channel - p1) / (p99 - p1)
+        
+        direct_signal = np.clip(direct_signal, 0, 1)
+        
+        # Apply enhancement
+        return self.enhancer.enhance(direct_signal)
+    
+    def estimate_scattering_coefficient(self, img_channel: np.ndarray, 
+                                      depths: np.ndarray, wavelength: int) -> float:
+        """
+        Estimate scattering coefficient for a given channel.
+        
+        Args:
+            img_channel: Single channel image
+            depths: Depth map
+            wavelength: Wavelength in nm
+            
+        Returns:
+            Estimated scattering coefficient
+        """
+        # Get water properties
+        water_props = AttenuationEstimator.WATER_PROPERTIES.get(
+            self.water_type, 
+            AttenuationEstimator.WATER_PROPERTIES['II']
+        )
+        
+        # Find closest wavelength
+        available_wavelengths = list(water_props['b'].keys())
+        closest_wavelength = min(available_wavelengths, key=lambda x: abs(x - wavelength))
+        
+        # Return theoretical scattering coefficient
+        return water_props['b'][closest_wavelength]
+    
+    def process(self, img: np.ndarray, depths: np.ndarray, 
+                p: float = 0.5, f: float = 2.0) -> np.ndarray:
+        """
+        Process underwater image using the full restoration pipeline.
+        
+        Args:
+            img: Input underwater image (RGB, 0-1 range)
+            depths: Depth map
+            p: Illumination mixing parameter
+            f: Illumination amplification factor
+            
+        Returns:
+            Restored image
+        """
+        # Wavelength mapping
+        wavelengths = {'R': 650, 'G': 550, 'B': 450}
+        
+        # Preprocess depth map
+        print("Preprocessing depth map...", flush=True)
+        depths = self.preprocess_depth_map(depths)
+        
+        # Estimate backscatter for each channel
+        print("Estimating backscatter...", flush=True)
+        backscatter_funcs = []
+        backscatter_params = []
+        
+        for c, (channel_name, wavelength) in enumerate(wavelengths.items()):
+            # Find backscatter points
+            B_pts = BackscatterModel.find_estimation_points(img[:, :, c], depths)
+            
+            # Estimate parameters
+            B_func, B_params = BackscatterModel.estimate_parameters(B_pts)
+            backscatter_funcs.append(B_func)
+            backscatter_params.append(B_params)
+            
+            print(f"  {channel_name} channel: B_inf={B_params[0]:.3f}, "
+                  f"beta_B={B_params[1]:.3f}, gamma={B_params[2]:.3f}")
+        
+        # Construct neighborhood map
+        print("Constructing neighborhood map...", flush=True)
+        nmap, n_neighborhoods = NeighborhoodMapper.construct_neighborhood_map(depths, epsilon=0.15)
+        nmap, n_neighborhoods = NeighborhoodMapper.refine_neighborhood_map(nmap, min_size=50)
+        print(f"  Found {n_neighborhoods} neighborhoods")
+        
+        # Estimate illumination for each channel
+        print("Estimating illumination...", flush=True)
+        illumination = np.zeros_like(img)
+        
+        for c, (channel_name, wavelength) in enumerate(wavelengths.items()):
+            # Get scattering coefficient
+            scatter_coeff = self.estimate_scattering_coefficient(img[:, :, c], depths, wavelength)
+            
+            # Compute backscatter
+            B_c = backscatter_funcs[c](depths)
+            
+            # Estimate illumination
+            illumination[:, :, c] = IlluminationEstimator.estimate(
+                img[:, :, c], B_c, depths, nmap, n_neighborhoods,
+                scatter_coeff, p=p, f=f
+            )
+        
+        # Estimate attenuation coefficients
+        print("Estimating attenuation coefficients...", flush=True)
+        beta = np.zeros((depths.shape[0], depths.shape[1], 3))
+        
+        for c, (channel_name, wavelength) in enumerate(wavelengths.items()):
+            beta[:, :, c] = AttenuationEstimator.estimate_wideband_attenuation(
+                depths, illumination[:, :, c], wavelength, self.water_type
+            )
+        
+        # Compute final backscatter
+        backscatter = np.zeros_like(img)
+        for c in range(3):
+            backscatter[:, :, c] = backscatter_funcs[c](depths)
+        
+        # Recover image
+        print("Recovering image...", flush=True)
+        recovered = self.recover_image(img, depths, backscatter, beta)
+        
+        return recovered
+
+
+# ================================================================================
+# Utility Functions
+# ================================================================================
+
+def load_image_and_depth_map(img_path: str, depth_path: str, 
+                           max_size: int = 1024) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Load and preprocess image and depth map.
     
     Args:
-        image: 输入图像
-        clahe_clip_limit: CLAHE对比度限制
-        clahe_grid_size: CLAHE网格大小
-        gamma: gamma校正值
-        alpha: CLAHE结果权重
-        beta: gamma校正结果权重
-        white_balance_method: 白平衡方法
-    
+        img_path: Path to image file
+        depth_path: Path to depth map file
+        max_size: Maximum image dimension
+        
     Returns:
-        增强后的图像
+        Tuple of (image, depth_map) both as numpy arrays
     """
-    processor = EnhancementProcessor(
-        clahe_clip_limit=clahe_clip_limit,
-        clahe_grid_size=clahe_grid_size,
-        gamma=gamma,
-        alpha=alpha,
-        beta=beta,
-        white_balance_method=white_balance_method
+    # Load image
+    img = cv2.imread(img_path)
+    if img is None:
+        raise ValueError(f"Could not load image from {img_path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    
+    # Load depth map
+    depth = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+    if depth is None:
+        raise ValueError(f"Could not load depth map from {depth_path}")
+    
+    # Resize if necessary
+    h, w = img.shape[:2]
+    if max(h, w) > max_size:
+        scale = max_size / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        depth = cv2.resize(depth, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    
+    # Normalize
+    img = img.astype(np.float32) / 255.0
+    depth = depth.astype(np.float32) / 255.0
+    
+    return img, depth
+
+
+def scale(img):
+    """
+    Scale image to 0-1 range.
+    
+    This function is provided for compatibility with the original codebase.
+    
+    Args:
+        img: Input image as numpy array
+        
+    Returns:
+        Scaled image in 0-1 range
+    """
+    img_float = img.astype(np.float32)
+    min_val = np.min(img_float)
+    max_val = np.max(img_float)
+    
+    if max_val - min_val < 1e-6:
+        # If image is uniform, return middle gray
+        return np.full_like(img_float, 0.5)
+    
+    return (img_float - min_val) / (max_val - min_val)
+
+
+def getUCIQE(img):
+    """
+    Calculate UCIQE (Underwater Color Image Quality Evaluation) metric.
+    
+    This is a placeholder function. In a full implementation, this would
+    calculate the UCIQE metric as described in:
+    Yang, M., & Sowmya, A. (2015). An underwater color image quality 
+    evaluation metric. IEEE Transactions on Image Processing.
+    
+    Args:
+        img: Input image (0-1 range or 0-255 range)
+        
+    Returns:
+        UCIQE score (higher is better)
+    """
+    # Ensure image is in 0-255 range
+    if img.max() <= 1.0:
+        img = (img * 255).astype(np.uint8)
+    
+    # Placeholder implementation
+    # In practice, this would calculate:
+    # - Chroma variance (σc)
+    # - Luminance contrast (conl)
+    # - Average saturation (μs)
+    # UCIQE = c1 * σc + c2 * conl + c3 * μs
+    
+    return 0.5  # Placeholder value
+
+
+# ================================================================================
+# Legacy Interface for Backward Compatibility
+# ================================================================================
+
+def run_pipeline(img: np.ndarray, depths: np.ndarray, args) -> np.ndarray:
+    """
+    Legacy interface function for backward compatibility with existing code.
+    
+    This function provides the same interface as the original improved_seathru.py
+    to ensure seamless integration with existing pipelines.
+    
+    Args:
+        img: Input underwater image (RGB, 0-1 range, float32/float64)
+        depths: Depth map (0-1 range, float32/float64)
+        args: Namespace object with attributes:
+            - p: Illumination estimation mixing parameter (default: 0.5)
+            - f: Illumination amplification factor (default: 2.0)
+            - water_type: Water type ('I', 'II', or 'III') (optional, default: 'II')
+            - min_depth: Minimum depth for backscatter estimation (optional)
+            - max_depth: Maximum depth for backscatter estimation (optional)
+            
+    Returns:
+        Enhanced image as numpy array (RGB, 0-1 range)
+    """
+    # Input validation and normalization
+    if img is None or depths is None:
+        raise ValueError("Input image and depth map cannot be None")
+    
+    # Ensure correct data types
+    img = img.astype(np.float32) if img.dtype != np.float32 else img
+    depths = depths.astype(np.float32) if depths.dtype != np.float32 else depths
+    
+    # Ensure inputs are in 0-1 range
+    if img.max() > 1.0:
+        print("Warning: Input image appears to be in 0-255 range, normalizing to 0-1")
+        img = img / 255.0
+    
+    if depths.max() > 1.0:
+        print("Warning: Depth map appears to be in 0-255 range, normalizing to 0-1")
+        depths = depths / 255.0
+    
+    # Validate image dimensions
+    if img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError(f"Input image must be RGB with shape (H, W, 3), got {img.shape}")
+    
+    if depths.ndim != 2:
+        raise ValueError(f"Depth map must be 2D with shape (H, W), got {depths.shape}")
+    
+    if img.shape[:2] != depths.shape:
+        raise ValueError(f"Image shape {img.shape[:2]} doesn't match depth shape {depths.shape}")
+    
+    # Extract parameters from args
+    p = getattr(args, 'p', 0.5)
+    f = getattr(args, 'f', 2.0)
+    water_type = getattr(args, 'water_type', 'II')
+    
+    # Validate parameters
+    p = np.clip(p, 0.0, 1.0)
+    f = max(0.1, f)  # Ensure f is positive
+    
+    if water_type not in ['I', 'II', 'III']:
+        print(f"Warning: Unknown water type '{water_type}', using 'II' (coastal)")
+        water_type = 'II'
+    
+    try:
+        # Create restoration pipeline
+        restorer = UnderwaterImageRestoration(water_type=water_type)
+        
+        # Process image
+        recovered = restorer.process(img, depths, p=p, f=f)
+        
+        # Ensure output is in correct format
+        recovered = np.clip(recovered, 0, 1).astype(np.float32)
+        
+        return recovered
+        
+    except Exception as e:
+        print(f"Error in underwater image restoration: {str(e)}")
+        print("Returning original image")
+        return img
+
+
+# ================================================================================
+# Main Entry Point
+# ================================================================================
+
+def main():
+    """
+    Main function for command-line usage.
+    """
+    import argparse
+    import matplotlib.pyplot as plt
+    
+    parser = argparse.ArgumentParser(
+        description='Underwater Image Enhancement using Improved SeaThru Algorithm'
     )
-    return processor.enhance(image)
-# 使用示例
-"""
-import cv2
-import numpy as np
-
-# 读取图像
-image = cv2.imread('underwater_image.jpg')
-image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-# 方法1：使用便捷函数
-enhanced = process_image(image)
-
-# 方法2：使用处理器类
-processor = EnhancementProcessor()
-enhanced = processor.enhance(image)
-
-# 保存结果
-enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_RGB2BGR)
-cv2.imwrite('enhanced_image.jpg', enhanced_bgr)
-"""
-
-def color_balance(img, strength=0.5):
-    img = img.astype(np.float32)
-    r, g, b = cv2.split(img)
-    r_avg, g_avg, b_avg = np.mean(r), np.mean(g), np.mean(b)
-    avg = (r_avg + g_avg + b_avg) / 3
-    
-    r = np.clip(r * (1 - strength + strength * (avg / r_avg)), 0, 1)
-    g = np.clip(g * (1 - strength + strength * (avg / g_avg)), 0, 1)
-    b = np.clip(b * (1 - strength + strength * (avg / b_avg)), 0, 1)
-    
-    return cv2.merge((r, g, b))
-
-
-def adaptive_depth_compensation(depths):
-    depth_mean = np.mean(depths)
-    depth_std = np.std(depths)
-    return 1 / (1 + np.exp(-(depths - depth_mean) / (depth_std + 1e-6)))
-
-def recover_image_improved(img, depths, B, beta_D, water_quality_map):
-    eps = 1e-8
-    depth_factor = adaptive_depth_compensation(depths)
-    res = (img - B) * np.exp(beta_D * np.expand_dims(depths * depth_factor, axis=2))
-    res = res / (water_quality_map[:, :, np.newaxis] + eps)
-    res = np.clip(res, 0, 1)
-    return post_process(res)
-
-    # res = (img - B) * np.exp(beta_D * np.expand_dims(depths, axis=2))
-def recover_image(img, depths, B, beta_D, water_quality_map):
-    # 限制指数的最大值，防止数值溢出
-    max_exponent = 10  # 根据实际情况调整
-    exponent = beta_D * np.expand_dims(depths, axis=2)
-    exponent = np.clip(exponent, 0, max_exponent)
-    
-    transmission = np.exp(-exponent)
-    direct_signal = (img - B) / (transmission + 1e-6)
-    
-    # 加入自适应对比度增强
-    #p2, p98 = np.percentile(direct_signal, (2, 98))
-    #direct_signal_enhanced = exposure.rescale_intensity(direct_signal, in_range=(p2, p98))
-    #water_quality_compensation = np.expand_dims(water_quality_map, axis=2)
-    #compensated_signal = direct_signal #* water_quality_compensation
-    # balanced = color_balance(compensated_signal)
-    # compensated_signal = post_process(compensated_signal)
-    direct_signal = np.clip(direct_signal, 0, 1)
-    return process_image(direct_signal)
-
-
-def evaluate_image_quality(original, recovered):
-    uciqe_score = getUCIQE(recovered)
-    ssim_score = ssim(original, recovered, multichannel=True)
-    psnr_score = psnr(original, recovered)
-    return {
-        'UCIQE': uciqe_score,
-        'SSIM': ssim_score,
-        'PSNR': psnr_score
-    }
-
-def construct_neighborhood_map(depths, epsilon=0.05):
-    eps = (np.max(depths) - np.min(depths)) * epsilon
-    nmap = np.zeros_like(depths).astype(np.int32)
-    n_neighborhoods = 1
-    while np.any(nmap == 0):
-        locs_x, locs_y = np.where(nmap == 0)
-        start_index = np.random.randint(0, len(locs_x))
-        start_x, start_y = locs_x[start_index], locs_y[start_index]
-        q = collections.deque()
-        q.append((start_x, start_y))
-        while not len(q) == 0:
-            x, y = q.pop()
-            if np.abs(depths[x, y] - depths[start_x, start_y]) <= eps:
-                nmap[x, y] = n_neighborhoods
-                for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                    x2, y2 = x + dx, y + dy
-                    if 0 <= x2 < depths.shape[0] and 0 <= y2 < depths.shape[1] and nmap[x2, y2] == 0:
-                        q.append((x2, y2))
-        n_neighborhoods += 1
-    zeros_size_arr = sorted(zip(*np.unique(nmap[depths == 0], return_counts=True)), key=lambda x: x[1], reverse=True)
-    if len(zeros_size_arr) > 0:
-        nmap[nmap == zeros_size_arr[0][0]] = 0 #reset largest background to 0
-    return nmap, n_neighborhoods - 1
-
-def find_closest_label(nmap, start_x, start_y):
-    mask = np.zeros_like(nmap).astype(np.bool_)
-    q = collections.deque()
-    q.append((start_x, start_y))
-    while not len(q) == 0:
-        x, y = q.pop()
-        if 0 <= x < nmap.shape[0] and 0 <= y < nmap.shape[1]:
-            if nmap[x, y] != 0:
-                return nmap[x, y]
-            mask[x, y] = True
-            for dx, dy in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-                x2, y2 = x + dx, y + dy
-                if 0 <= x2 < nmap.shape[0] and 0 <= y2 < nmap.shape[1] and not mask[x2, y2]:
-                    q.append((x2, y2))
-    return 0
-
-def refine_neighborhood_map(nmap, min_size = 10, radius = 3):
-    refined_nmap = np.zeros_like(nmap)
-    vals, counts = np.unique(nmap, return_counts=True)
-    neighborhood_sizes = sorted(zip(vals, counts), key=lambda x: x[1], reverse=True)
-    num_labels = 1
-    for label, size in neighborhood_sizes:
-        if size >= min_size and label != 0:
-            refined_nmap[nmap == label] = num_labels
-            num_labels += 1
-    for label, size in neighborhood_sizes:
-        if size < min_size and label != 0:
-            for x, y in zip(*np.where(nmap == label)):
-                refined_nmap[x, y] = find_closest_label(refined_nmap, x, y)
-    refined_nmap = closing(refined_nmap, square(radius))
-    return refined_nmap, num_labels - 1
-
-def load_image_and_depth_map(img_fname, depths_fname, size_limit = 1024):
-    depths = Image.open(depths_fname)
-    img = Image.fromarray(rawpy.imread(img_fname).postprocess())
-    img.thumbnail((size_limit, size_limit), Image.ANTIALIAS)
-    depths = depths.resize(img.size, Image.ANTIALIAS)
-    return np.float32(img) / 255.0, np.array(depths)
-
-#def estimate_scattering_coefficient(img, depths):
-    # 简单估计散射系数
-#    return np.mean(img) / np.mean(depths)
-import scipy as sp
-import scipy.optimize as opt
-import scipy.stats as stats
-
-
-def estimate_scattering_coefficient(img_channel, depths, wavelength, water_type='I'):
-    # 根据水体类型和波长获取吸收系数和初始散射系数
-    a_coeff = get_absorption_coefficient(water_type, wavelength)
-    b_initial = get_scattering_coefficient_from_water_type(water_type, wavelength)
-    
-    # 估计 B_inf 和 beta_B
-    depth_threshold = np.percentile(depths, 90)
-    B_inf = estimate_B_inf(img_channel, depths, depth_threshold)
-    beta_B = b_initial  # 近似取 beta_B = b_initial
-
-    # 将图像和深度展开为一维数组
-    I = img_channel.flatten()
-    z = depths.flatten()
-
-    # 构建模型函数
-    def model_function(z, b):
-        return np.exp(-(a_coeff + b) * z) + B_inf * (1 - np.exp(-beta_B * z))
-
-    # 使用非线性最小二乘拟合，初始猜测为 b_initial
-    popt, _ = opt.curve_fit(model_function, z, I, p0=[b_initial], bounds=(0, np.inf))
-
-    scattering_coefficient = popt[0]
-    return scattering_coefficient
-
-def get_absorption_coefficient(water_type, wavelength):
-    # 定义 I 型水体的吸收系数
-    absorption_coefficients = {
-        450: 0.015,  # 蓝光
-        550: 0.035,  # 绿光
-        650: 0.065   # 红光
-    }
-    return absorption_coefficients.get(wavelength, 0.035)  # 默认取绿光
-
-def get_scattering_coefficient_from_water_type(water_type, wavelength):
-    # 定义 I 型水体的散射系数
-    scattering_coefficients = {
-        450: 0.032,  # 蓝光
-        550: 0.020,  # 绿光
-        650: 0.010   # 红光
-    }
-    return scattering_coefficients.get(wavelength, 0.020)  # 默认取绿光
-
-def estimate_B_inf(img_channel, depths, depth_threshold):
-    # 选择深度大于阈值的区域
-    deep_region_mask = depths > depth_threshold
-    # 防止空区域
-    if np.sum(deep_region_mask) == 0:
-        deep_region_mask = depths > (depth_threshold * 0.9)
-    # 计算深度较大区域的平均像素值
-    B_inf = np.mean(img_channel[deep_region_mask])
-    return B_inf
-
-
-
-
-
-def estimate_water_quality_map(img, depths):
-    brightness = np.mean(img, axis=2)
-    normalized_depth = (depths - np.min(depths)) / (np.max(depths) - np.min(depths))
-    turbidity = 1 - brightness  # 假设亮度越低，浑浊度越高
-    absorption = 0.1 + 0.2 * normalized_depth
-    scattering = 0.05 + 0.1 * turbidity
-    water_quality = 1 / (absorption + scattering + 1e-6)
-    return water_quality
-
-def adaptive_backscatter_model(depth, B_inf, beta_B, gamma, local_std, alpha=0.5):
-    return B_inf * (1 - np.exp(-beta_B * (depth**gamma) * (1 + alpha * np.tanh(local_std))))
-
-def compute_local_std(img, kernel_size=5):
-    return cv2.GaussianBlur(np.std(img, axis=2), (kernel_size, kernel_size), 0)
-
-
-def smooth_depth_map(depths, kernel_size=5):
-    return cv2.edgePreservingFilter(depths.astype(np.float32), flags=1, sigma_s=kernel_size, sigma_r=0.1)
-
-# 在 run_pipeline 函数中使用
-
-
-def run_pipeline(img, depths, args):
-    wavelengths = {'R': 650, 'G': 550, 'B': 450}
-    
-    #     # 确保depths是浮点类型，范围在0-1之间
-    # if depths.dtype != np.float32 and depths.dtype != np.float64:
-    #     print(f'Converting depths from {depths.dtype} to float32', flush=True)
-    #     if depths.max() > 1.0:
-    #         # 如果depths是0-255范围，归一化到0-1
-    #         depths = depths.astype(np.float32) / 255.0
-    #     else:
-    #         depths = depths.astype(np.float32)
-    
-    # 确保depths的值在合理范围内
-    # depths = np.clip(depths, 0.01, 1.0)  # 避免零深度
-    depths = smooth_depth_map(depths)
-    print('Estimating backscatter...', flush=True)
-    Br, coefs_r = find_backscatter_values_improved(find_backscatter_estimation_points(img[:,:,0], depths), depths, wavelength=620)
-    Bg, coefs_g = find_backscatter_values_improved(find_backscatter_estimation_points(img[:,:,1], depths), depths, wavelength=540)
-    Bb, coefs_b = find_backscatter_values_improved(find_backscatter_estimation_points(img[:,:,2], depths), depths, wavelength=450)
-
-    print('Constructing neighborhood map...', flush=True)
-    nmap, n = construct_neighborhood_map(depths, 0.1)
-    nmap, n = refine_neighborhood_map(nmap, 50)
-
-    print('Estimating illumination...', flush=True)
-    scattering_coeff_R = estimate_scattering_coefficient(img[:,:,0], depths, 650)
-    scattering_coeff_G = estimate_scattering_coefficient(img[:,:,1], depths, 550)
-    scattering_coeff_B = estimate_scattering_coefficient(img[:,:,2], depths, 450)
-    illR = estimate_illumination_improved(img[:,:,0], Br(depths), depths, nmap, n, scattering_coeff_R, p=args.p, f=args.f)
-    illG = estimate_illumination_improved(img[:,:,1], Bg(depths), depths, nmap, n, scattering_coeff_G, p=args.p, f=args.f)
-    illB = estimate_illumination_improved(img[:,:,2], Bb(depths), depths, nmap, n, scattering_coeff_B, p=args.p, f=args.f)
-
-    print('Estimating wideband attenuation...', flush=True)
-    beta_D_r = estimate_wideband_attenuation_improved(depths, illR, wavelength=620)
-    beta_D_g = estimate_wideband_attenuation_improved(depths, illG, wavelength=540)
-    beta_D_b = estimate_wideband_attenuation_improved(depths, illB, wavelength=450)
-
-    print('Reconstructing image...', flush=True)
-    local_std = compute_local_std(img)
-    B = np.stack([
-        adaptive_backscatter_model(depths, *coefs_r, local_std),
-        adaptive_backscatter_model(depths, *coefs_g, local_std),
-        adaptive_backscatter_model(depths, *coefs_b, local_std)
-    ], axis=2)
-
-    beta_D = np.stack([beta_D_r, beta_D_g, beta_D_b], axis=2)
-    water_quality_map = estimate_water_quality_map(img, depths)
-    recovered = recover_image(img, depths, B, beta_D, water_quality_map)
-    return recovered
-
-    #B = np.stack([Br(depths), Bg(depths), Bb(depths)], axis=2)
-
-    #quality_metrics = evaluate_image_quality(img, recovered)
-    #print(f"Image quality metrics: {quality_metrics}")
-
-#, quality_metrics
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Run improved SeaThru pipeline')
-    parser.add_argument('--image', type=str, required=True, help='Path to input image')
-    parser.add_argument('--depth', type=str, required=True, help='Path to depth map')
-    parser.add_argument('--output', type=str, required=True, help='Path to output image')
-    parser.add_argument('--p', type=float, default=0.7, help='Illumination estimation parameter')
-    parser.add_argument('--f', type=float, default=3.0, help='Illumination estimation parameter')
-    parser.add_argument('--min_depth', type=float, default=0.0, help='Minimum depth for backscatter estimation')
-    parser.add_argument('--spread_data_fraction', type=float, default=0.01, help='Fraction for data spreading in attenuation estimation')
-    parser.add_argument('--l', type=float, default=1.0, help='Attenuation estimation parameter')
+    parser.add_argument('--image', type=str, required=True, 
+                       help='Path to input underwater image')
+    parser.add_argument('--depth', type=str, required=True, 
+                       help='Path to depth map')
+    parser.add_argument('--output', type=str, required=True, 
+                       help='Path to output enhanced image')
+    parser.add_argument('--water-type', type=str, default='II', 
+                       choices=['I', 'II', 'III'],
+                       help='Water type: I (clear), II (coastal), III (turbid)')
+    parser.add_argument('--p', type=float, default=0.5, 
+                       help='Illumination estimation mixing parameter')
+    parser.add_argument('--f', type=float, default=2.0, 
+                       help='Illumination amplification factor')
     
     args = parser.parse_args()
     
+    # Load data
+    print("Loading image and depth map...")
     img, depths = load_image_and_depth_map(args.image, args.depth)
-    recovered, metrics = run_pipeline(img, depths, args)
     
+    # Method 1: Direct class usage (recommended for new code)
+    restorer = UnderwaterImageRestoration(water_type=args.water_type)
+    recovered = restorer.process(img, depths, p=args.p, f=args.f)
+    
+    # Method 2: Legacy interface (for backward compatibility)
+    # recovered = run_pipeline(img, depths, args)
+    
+    # Save result
     plt.imsave(args.output, recovered)
-    print(f"Recovered image saved to {args.output}")
-    print(f"Final image quality metrics: {metrics}")
+    print(f"Enhanced image saved to {args.output}")
+    
+    # Display comparison
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(img)
+    axes[0].set_title('Original')
+    axes[0].axis('off')
+    
+    axes[1].imshow(depths, cmap='gray')
+    axes[1].set_title('Depth Map')
+    axes[1].axis('off')
+    
+    axes[2].imshow(recovered)
+    axes[2].set_title('Enhanced')
+    axes[2].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
